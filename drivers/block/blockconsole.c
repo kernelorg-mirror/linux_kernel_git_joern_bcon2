@@ -49,11 +49,11 @@ struct bcon_bio {
 
 struct blockconsole {
 	char devname[32];
+	atomic64_t console_bytes;
 	spinlock_t end_io_lock;
 	struct timer_list pad_timer;
 	int error_count;
 	struct kref kref;
-	u64 console_bytes;
 	u64 write_bytes;
 	u64 max_bytes;
 	u32 round;
@@ -107,7 +107,7 @@ static int __bcon_console_ofs(u64 console_bytes)
 
 static int bcon_console_ofs(struct blockconsole *bc)
 {
-	return __bcon_console_ofs(bc->console_bytes);
+	return __bcon_console_ofs(atomic64_read(&bc->console_bytes));
 }
 
 static int __bcon_console_sector(u64 console_bytes)
@@ -117,7 +117,7 @@ static int __bcon_console_sector(u64 console_bytes)
 
 static int bcon_console_sector(struct blockconsole *bc)
 {
-	return __bcon_console_sector(bc->console_bytes);
+	return __bcon_console_sector(atomic64_read(&bc->console_bytes));
 }
 
 static int bcon_write_sector(struct blockconsole *bc)
@@ -135,7 +135,7 @@ static void bcon_init_first_page(struct blockconsole *bc)
 {
 	char *buf = page_address(bc->pages);
 	size_t len = strlen(BLOCKCONSOLE_MAGIC);
-	u32 tile = bc->console_bytes >> 20; /* We overflow after 4TB - fine */
+	u32 tile = atomic64_read(&bc->console_bytes) >> 20; /* We overflow after 4TB - fine */
 
 	clear_sector(buf);
 	memcpy(buf, BLOCKCONSOLE_MAGIC, len);
@@ -153,7 +153,7 @@ static void bcon_advance_console_bytes(struct blockconsole *bc, int bytes)
 	u64 old, new;
 
 	do {
-		old = bc->console_bytes;
+		old = atomic64_read(&bc->console_bytes);
 		new = old + bytes;
 		if (new >= bc->max_bytes)
 			new = 0;
@@ -161,7 +161,7 @@ static void bcon_advance_console_bytes(struct blockconsole *bc, int bytes)
 			bcon_init_first_page(bc);
 			new += BCON_LONG_HEADERSIZE;
 		}
-	} while (cmpxchg64(&bc->console_bytes, old, new) != old);
+	} while (atomic64_cmpxchg(&bc->console_bytes, old, new) != old);
 }
 
 static void request_complete(struct bio *bio, int err)
@@ -268,7 +268,8 @@ static int bcon_find_end_of_log(struct blockconsole *bc)
 			start = middle;
 		}
 	}
-	bc->console_bytes = bc->write_bytes = end;
+	bc->write_bytes = end;
+	atomic64_set(&bc->console_bytes, end);
 	bcon_advance_console_bytes(bc, 0); /* To skip the header */
 	bcon_advance_write_bytes(bc, 0); /* To wrap around, if necessary */
 	bcon_erase_segment(bc);
@@ -399,7 +400,7 @@ static void bcon_write(struct console *console, const char *msg,
 	int i;
 
 	while (len) {
-		console_bytes = bc->console_bytes;
+		console_bytes = atomic64_read(&bc->console_bytes);
 		i = __bcon_console_sector(console_bytes);
 		rmb();
 		if (bc->bio_array[i].in_flight)
@@ -515,8 +516,8 @@ static int bcon_create(const char *devname)
 	bc->panic_block.notifier_call = blockconsole_panic;
 	bc->panic_block.priority = INT_MAX;
 	atomic_notifier_chain_register(&panic_notifier_list, &bc->panic_block);
-	pr_info("now logging to %s at %llx\n", devname, bc->console_bytes >> 20);
-
+	pr_info("now logging to %s at %llx\n", devname,
+			atomic64_read(&bc->console_bytes) >> 20);
 	return 0;
 
 out2:
