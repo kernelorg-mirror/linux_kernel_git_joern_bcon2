@@ -16,7 +16,7 @@
  * Atomically reads the value of @v.
  * Doesn't imply a read memory barrier.
  */
-static inline long atomic64_read(const atomic64_t *v)
+static inline long long atomic64_read(const atomic64_t *v)
 {
 	return (*(volatile long *)&(v)->counter);
 }
