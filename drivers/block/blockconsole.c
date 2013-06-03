@@ -2,6 +2,55 @@
  * Blockconsole - write kernel console to a block device
  *
  * Copyright (C) 2012  Joern Engel <joern@logfs.org>
+ *
+ * For usage and disk format, please see
+ * Documentation/block/blockconsole.txt
+ *
+ * Blockconsole allocates a 1MB buffer at init time.  printk() calls
+ * bcon_write(), which simply writes to the buffer and wakes up a
+ * writeback thread.  bcon_writeback() will then write the console out
+ * to the blockdevice, in chunks of sector_size.
+ *
+ * All allocations for blockconsole happen at init time.  All means
+ * 1MB worth of buffer, a struct bio for every 512B sector, plus
+ * another page and struct bio to zero the current 1MB of the device
+ * before writing to it.
+ *
+ * The block layer and device drivers may require further memory
+ * allocations do sleeping calls and require all sorts of
+ * infrastructure.  In such cases, writeback may be delayed or fail
+ * altogether.  But since writeback is decoupled from printk(), the
+ * worst consequence should be loss of debug information - which would
+ * be lost without blockconsole as well.
+ *
+ * On top of the writeback thread, bcon_write() also schedules a 1s
+ * timer.  When the timer expires, the current partial sector will be
+ * padded and written out as well.  Blockconsole does no overwrites,
+ * so a spurious line of up to 510 spaces and a newline is the result.
+ *
+ * There is a panic handler that tries to push out the last dying
+ * breath.  Sometimes that works, sometimes it causes a secondary
+ * oops.  I have never seen it do harm and when it does work it
+ * provides useful crash information.
+ *
+ * In cases where more printk data comes in the front door than the
+ * backing device can handle, there will be data loss.  Again,
+ * blockconsole is best-effort.  Given the 1MB buffer it takes an
+ * extreme slow device or a deliberate attempt to overflow the buffer,
+ * so this is almost never a problem in practice.
+ *
+ * In case the device is already filled with data (particularly after
+ * blockconsole wraps around), each 1MB tile is written with zeroes
+ * once before the regular sector writes happen.  Noone should
+ * interpret stale data from before the wrap-around as current - or
+ * have to guess where the current data ends and the stale data
+ * begins.
+ *
+ * Detection of console devices currently works by abusing partition
+ * scanning.  Blockconsole is registered as a partition table format
+ * and, if it finds the proper header, will use the device in question
+ * as a log device.  That means logging to a partition is not
+ * currently possible.
  */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
@@ -346,6 +395,12 @@ static void bcon_writesector(struct blockconsole *bc, int index)
 	submit_bio(WRITE, bio);
 }
 
+/**
+ * bcon_writeback - the writeback thread
+ * @_bc:	The struct blockconsole
+ *
+ * Will loop and writeback any full sectors, then go back to sleep.
+ */
 static int bcon_writeback(void *_bc)
 {
 	struct blockconsole *bc = _bc;
@@ -415,6 +470,9 @@ static void bcon_write(struct console *console, const char *msg,
 	mod_timer(&bc->pad_timer, jiffies + HZ);
 }
 
+/**
+ * bcon_init_bios - initialize the struct bio array
+ */
 static void bcon_init_bios(struct blockconsole *bc)
 {
 	int i;
@@ -451,6 +509,12 @@ static void bcon_init_zero_bio(struct blockconsole *bc)
 	}
 }
 
+/**
+ * blockconsole_panic - panic notifier
+ *
+ * Tries to write back any crash information.  This fails fairly
+ * regularly.  As always, blockconsole is best-effort.
+ */
 static int blockconsole_panic(struct notifier_block *this, unsigned long event,
 		void *ptr)
 {
