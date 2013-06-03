@@ -3,6 +3,8 @@
  *
  * Copyright (C) 2012  Joern Engel <joern@logfs.org>
  */
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/bio.h>
 #include <linux/blockconsole.h>
 #include <linux/console.h>
@@ -36,9 +38,6 @@
 #define SECTOR_SIZE		(1 << SECTOR_SHIFT)
 #define SECTOR_MASK		(~(SECTOR_SIZE-1))
 #define PG_SECTOR_MASK		((PAGE_SIZE >> 9) - 1)
-
-#undef pr_fmt
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 struct bcon_bio {
 	struct bio bio;
