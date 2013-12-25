@@ -609,39 +609,37 @@ static void bcon_create_fuzzy(const char *name)
 	}
 }
 
-static DEFINE_SPINLOCK(bcon_device_lock);
-static char scanned_devices[80];
+struct bcon_candidate {
+	struct work_struct work;
+	char name[0];
+};
 
+/*
+ * Calling bcon_create_fuzzy directly would cause a deadlock.  __blkdev_get
+ * will take bdev->bd_mutex, which is already held by the partitioning code.
+ * Hence go through the indirection of a work queue.
+ */
 static void bcon_do_add(struct work_struct *work)
 {
-	char local_devices[80], *name, *remainder = local_devices;
+	struct bcon_candidate *cand = container_of(work, struct bcon_candidate,
+			work);
 
-	spin_lock(&bcon_device_lock);
-	memcpy(local_devices, scanned_devices, sizeof(local_devices));
-	memset(scanned_devices, 0, sizeof(scanned_devices));
-	spin_unlock(&bcon_device_lock);
-
-	while (remainder && remainder[0]) {
-		name = strsep(&remainder, ",");
-		bcon_create_fuzzy(name);
-	}
+	bcon_create_fuzzy(cand->name);
+	kfree(cand);
 }
-
-static DECLARE_WORK(bcon_add_work, bcon_do_add);
 
 void bcon_add(const char *name)
 {
-	/*
-	 * We add each name to a small static buffer and ask for a workqueue
-	 * to go pick it up asap.  Once it is picked up, the buffer is empty
-	 * again, so hopefully it will suffice for all sane users.
-	 */
-	spin_lock(&bcon_device_lock);
-	if (scanned_devices[0])
-		strncat(scanned_devices, ",", sizeof(scanned_devices));
-	strncat(scanned_devices, name, sizeof(scanned_devices));
-	spin_unlock(&bcon_device_lock);
-	schedule_work(&bcon_add_work);
+	struct bcon_candidate *cand;
+	size_t len;
+
+	len = strlen(name) + 1;
+	cand = kmalloc(sizeof(cand) + len, GFP_KERNEL);
+	if (!cand)
+		return;
+	memcpy(cand->name, name, len);
+	INIT_WORK(&cand->work, bcon_do_add);
+	schedule_work(&cand->work);
 }
 
 /*
