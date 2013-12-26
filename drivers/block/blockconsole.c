@@ -281,6 +281,42 @@ static void bcon_advance_write_bytes(struct blockconsole *bc, int bytes)
 	}
 }
 
+/*
+ * Check if we have an 8-digit hex number followed by newline
+ */
+static bool is_four_byte_hex(const void *data)
+{
+	const char *str = data;
+	int len = 0;
+
+	while (isxdigit(*str) && len++ < 9)
+		str++;
+
+	if (len != 8)
+		return false;
+
+	/* str should point to a \n now */
+	if (*str != 0xa)
+		return false;
+
+	return true;
+}
+
+static int bcon_magic_present(const void *data)
+{
+	size_t len = strlen(BLOCKCONSOLE_MAGIC);
+
+	if (memcmp(data, BLOCKCONSOLE_MAGIC, len))
+		return 0;
+	if (!is_four_byte_hex(data + BCON_UUID_OFS))
+		return 0;
+	if (!is_four_byte_hex(data + BCON_ROUND_OFS))
+		return 0;
+	if (!is_four_byte_hex(data + BCON_TILE_OFS))
+		return 0;
+	return 11;
+}
+
 static int bcon_find_end_of_log(struct blockconsole *bc)
 {
 	u64 start = 0, end = bc->max_bytes, middle;
@@ -640,40 +676,4 @@ void bcon_add(const char *name)
 	memcpy(cand->name, name, len);
 	INIT_WORK(&cand->work, bcon_do_add);
 	schedule_work(&cand->work);
-}
-
-/*
- * Check if we have an 8-digit hex number followed by newline
- */
-static bool is_four_byte_hex(const void *data)
-{
-	const char *str = data;
-	int len = 0;
-
-	while (isxdigit(*str) && len++ < 9)
-		str++;
-
-	if (len != 8)
-		return false;
-
-	/* str should point to a \n now */
-	if (*str != 0xa)
-		return false;
-
-	return true;
-}
-
-int bcon_magic_present(const void *data)
-{
-	size_t len = strlen(BLOCKCONSOLE_MAGIC);
-
-	if (memcmp(data, BLOCKCONSOLE_MAGIC, len))
-		return 0;
-	if (!is_four_byte_hex(data + BCON_UUID_OFS))
-		return 0;
-	if (!is_four_byte_hex(data + BCON_ROUND_OFS))
-		return 0;
-	if (!is_four_byte_hex(data + BCON_TILE_OFS))
-		return 0;
-	return 11;
 }

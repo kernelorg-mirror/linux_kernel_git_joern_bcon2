@@ -521,9 +521,7 @@ rescan:
 			       disk->disk_name, p, -PTR_ERR(part));
 			continue;
 		}
-#ifdef CONFIG_BLOCKCONSOLE
 		bcon_add(dev_name(part_to_dev(part)));
-#endif
 #ifdef CONFIG_BLK_DEV_MD
 		if (state->parts[p].flags & ADDPART_FLAG_RAID)
 			md_autodetect_dev(part_to_dev(part)->devt);
