@@ -149,7 +149,6 @@ check_partition(struct gendisk *hd, struct block_device *bdev)
 		free_page((unsigned long)state->pp_buf);
 		return state;
 	}
-	bcon_add(state->name);
 	if (state->access_beyond_eod)
 		err = -ENOSPC;
 	if (err)

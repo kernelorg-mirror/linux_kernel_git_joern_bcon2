@@ -68,6 +68,8 @@
 #include <linux/workqueue.h>
 #include <linux/sched.h>
 #include <linux/ctype.h>
+#include <linux/device.h>
+#include <linux/genhd.h>
 
 #define BLOCKCONSOLE_MAGIC	"\nLinux blockconsole version 1.1\n"
 #define BCON_UUID_OFS		(32)
@@ -565,7 +567,7 @@ static int blockconsole_panic(struct notifier_block *this, unsigned long event,
 	return NOTIFY_DONE;
 }
 
-static int bcon_create(const char *devname)
+static int bcon_create(dev_t devt)
 {
 	const fmode_t mode = FMODE_READ | FMODE_WRITE;
 	struct blockconsole *bc;
@@ -574,22 +576,18 @@ static int bcon_create(const char *devname)
 	bc = kzalloc(sizeof(*bc), GFP_KERNEL);
 	if (!bc)
 		return -ENOMEM;
-	memset(bc->devname, ' ', sizeof(bc->devname));
-	strlcpy(bc->devname, devname, sizeof(bc->devname));
 	spin_lock_init(&bc->end_io_lock);
 	strcpy(bc->console.name, "bcon");
 	bc->console.flags = CON_PRINTBUFFER | CON_ENABLED | CON_ALLDATA;
 	bc->console.write = bcon_write;
-	bc->bdev = blkdev_get_by_path(devname, mode, NULL);
-#ifndef MODULE
-	if (IS_ERR(bc->bdev)) {
-		dev_t devt = name_to_dev_t(devname);
-		if (devt)
-			bc->bdev = blkdev_get_by_dev(devt, mode, NULL);
-	}
-#endif
+
+	bc->bdev = blkdev_get_by_dev(devt, mode, NULL);
 	if (IS_ERR(bc->bdev))
 		goto out;
+
+	memset(bc->devname, ' ', sizeof(bc->devname));
+	strlcpy(bc->devname, dev_name(part_to_dev(bc->bdev->bd_part)),
+			sizeof(bc->devname));
 	bc->pages = alloc_pages(GFP_KERNEL, 8);
 	if (!bc->pages)
 		goto out;
@@ -605,7 +603,7 @@ static int bcon_create(const char *devname)
 		goto out2;
 	kref_init(&bc->kref); /* This reference gets freed on errors */
 	bc->writeback_thread = kthread_run(bcon_writeback, bc, "bcon_%s",
-			devname);
+			bc->devname);
 	if (IS_ERR(bc->writeback_thread))
 		goto out2;
 	INIT_WORK(&bc->unregister_work, bcon_unregister);
@@ -614,7 +612,7 @@ static int bcon_create(const char *devname)
 	bc->panic_block.notifier_call = blockconsole_panic;
 	bc->panic_block.priority = INT_MAX;
 	atomic_notifier_chain_register(&panic_notifier_list, &bc->panic_block);
-	pr_info("now logging to %s at %llx\n", devname,
+	pr_info("now logging to %s at %llx\n", bc->devname,
 			atomic64_read(&bc->console_bytes) >> 20);
 	return 0;
 
@@ -628,31 +626,14 @@ out:
 	return -ENOMEM;
 }
 
-static void bcon_create_fuzzy(const char *name)
-{
-	char *longname;
-	int err;
-
-	err = bcon_create(name);
-	if (err) {
-		longname = kzalloc(strlen(name) + 6, GFP_KERNEL);
-		if (!longname)
-			return;
-		strcpy(longname, "/dev/");
-		strcat(longname, name);
-		bcon_create(longname);
-		kfree(longname);
-	}
-}
-
 struct bcon_candidate {
 	struct work_struct work;
-	char name[0];
+	dev_t devt;
 };
 
 /*
- * Calling bcon_create_fuzzy directly would cause a deadlock.  __blkdev_get
- * will take bdev->bd_mutex, which is already held by the partitioning code.
+ * Calling bcon_create directly would cause a deadlock.  __blkdev_get will
+ * take bdev->bd_mutex, which is already held by the partitioning code.
  * Hence go through the indirection of a work queue.
  */
 static void bcon_do_add(struct work_struct *work)
@@ -660,20 +641,18 @@ static void bcon_do_add(struct work_struct *work)
 	struct bcon_candidate *cand = container_of(work, struct bcon_candidate,
 			work);
 
-	bcon_create_fuzzy(cand->name);
+	bcon_create(cand->devt);
 	kfree(cand);
 }
 
-void bcon_add(const char *name)
+void bcon_add(dev_t devt)
 {
 	struct bcon_candidate *cand;
-	size_t len;
 
-	len = strlen(name) + 1;
-	cand = kmalloc(sizeof(cand) + len, GFP_KERNEL);
+	cand = kmalloc(sizeof(cand), GFP_KERNEL);
 	if (!cand)
 		return;
-	memcpy(cand->name, name, len);
+	cand->devt = devt;
 	INIT_WORK(&cand->work, bcon_do_add);
 	schedule_work(&cand->work);
 }
