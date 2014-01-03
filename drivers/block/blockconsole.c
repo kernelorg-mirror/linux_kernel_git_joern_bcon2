@@ -90,7 +90,7 @@
 #define CACHE_SIZE		(PAGE_COUNT << PAGE_SHIFT)
 #define CACHE_MASK		(CACHE_SIZE - 1)
 #define SECTOR_SHIFT		(9)
-#define SECTOR_SIZE		(1 << SECTOR_SHIFT)
+#define SECTOR_SIZE		(1u << SECTOR_SHIFT)
 #define SECTOR_MASK		(~(SECTOR_SIZE-1))
 #define PG_SECTOR_MASK		((PAGE_SIZE >> 9) - 1)
 
@@ -154,27 +154,27 @@ static void bcon_put(struct blockconsole *bc)
 	kref_put(&bc->kref, bcon_release);
 }
 
-static int __bcon_console_ofs(u64 console_bytes)
+static unsigned int __bcon_console_ofs(u64 console_bytes)
 {
 	return console_bytes & ~SECTOR_MASK;
 }
 
-static int bcon_console_ofs(struct blockconsole *bc)
+static unsigned int bcon_console_ofs(struct blockconsole *bc)
 {
 	return __bcon_console_ofs(atomic64_read(&bc->console_bytes));
 }
 
-static int __bcon_console_sector(u64 console_bytes)
+static unsigned int __bcon_console_sector(u64 console_bytes)
 {
 	return (console_bytes >> SECTOR_SHIFT) & CACHE_SECTOR_MASK;
 }
 
-static int bcon_console_sector(struct blockconsole *bc)
+static unsigned int bcon_console_sector(struct blockconsole *bc)
 {
 	return __bcon_console_sector(atomic64_read(&bc->console_bytes));
 }
 
-static int bcon_write_sector(struct blockconsole *bc)
+static unsigned int bcon_write_sector(struct blockconsole *bc)
 {
 	return (bc->write_bytes >> SECTOR_SHIFT) & CACHE_SECTOR_MASK;
 }
@@ -501,8 +501,7 @@ static void bcon_write(struct console *console, const char *msg,
 		rmb();
 		if (bc->bio_array[i].in_flight)
 			break;
-		n = min_t(int, len, SECTOR_SIZE -
-				__bcon_console_ofs(console_bytes));
+		n = min(len, SECTOR_SIZE - __bcon_console_ofs(console_bytes));
 		memcpy(bc->bio_array[i].sector +
 				__bcon_console_ofs(console_bytes), msg, n);
 		len -= n;
