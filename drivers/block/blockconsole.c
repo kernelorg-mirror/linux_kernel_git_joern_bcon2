@@ -46,11 +46,16 @@
  * have to guess where the current data ends and the stale data
  * begins.
  *
- * Detection of console devices currently works by abusing partition
- * scanning.  Blockconsole is registered as a partition table format
- * and, if it finds the proper header, will use the device in question
- * as a log device.  That means logging to a partition is not
- * currently possible.
+ * Detection of console devices currently works by having the partition
+ * scanning code call bcon_add() once for every partition and once for
+ * every device.  If we find a valid header, the device is automatically
+ * used.
+ *
+ * Removal of console devices is also automatic - sooner or later a
+ * removed device will cause write errors and any device that
+ * consistently returns write errors will get removed.  Main goal here
+ * was to be resilient against flaky hardware, using the same code to
+ * handle device removal is a bonus and ensures test coverage.
  */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
