@@ -1455,6 +1455,7 @@ EXPORT_SYMBOL(iput);
  *	That is, asked for block 4 of inode 1 the function will return the
  *	disk block relative to the disk start that holds that block of the
  *	file.
+ *	Returns zero in case of errors (usually an unmapped block).
  */
 sector_t bmap(struct inode *inode, sector_t block)
 {

@@ -62,19 +62,20 @@
 #include <linux/bio.h>
 #include <linux/blockconsole.h>
 #include <linux/console.h>
+#include <linux/ctype.h>
+#include <linux/device.h>
 #include <linux/fs.h>
+#include <linux/genhd.h>
 #include <linux/kref.h>
 #include <linux/kthread.h>
 #include <linux/mm.h>
+#include <linux/module.h>
 #include <linux/mount.h>
 #include <linux/random.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/workqueue.h>
-#include <linux/sched.h>
-#include <linux/ctype.h>
-#include <linux/device.h>
-#include <linux/genhd.h>
 
 #define BLOCKCONSOLE_MAGIC	"\nLinux blockconsole version 1.1\n"
 #define BCON_UUID_OFS		(32)
@@ -83,22 +84,28 @@
 #define BCON_HEADERSIZE		(50)
 #define BCON_LONG_HEADERSIZE	(59) /* with tile index */
 
-#define PAGE_COUNT		(256)
-#define SECTOR_COUNT		(PAGE_COUNT * (PAGE_SIZE >> 9))
+#define MAX_EXTENTS		(16) /* 256 bytes for extent_map on 64bit */
+#define CACHE_SIZE		(1024 * 1024)
+#define PAGE_COUNT		(CACHE_SIZE >> PAGE_SHIFT)
+#define SECTOR_SHIFT		(9)
+#define SECTOR_COUNT		(CACHE_SIZE >> SECTOR_SHIFT)
 #define CACHE_PAGE_MASK		(PAGE_COUNT - 1)
 #define CACHE_SECTOR_MASK	(SECTOR_COUNT - 1)
-#define CACHE_SIZE		(PAGE_COUNT << PAGE_SHIFT)
 #define CACHE_MASK		(CACHE_SIZE - 1)
-#define SECTOR_SHIFT		(9)
 #define SECTOR_SIZE		(1u << SECTOR_SHIFT)
 #define SECTOR_MASK		(~(SECTOR_SIZE-1))
-#define PG_SECTOR_MASK		((PAGE_SIZE >> 9) - 1)
+#define PG_SECTOR_MASK		((PAGE_SIZE >> SECTOR_SHIFT) - 1)
 
 struct bcon_bio {
 	struct bio bio;
 	struct bio_vec bvec;
 	void *sector;
 	int in_flight;
+};
+
+struct bcon_extent {
+	sector_t ofs;
+	sector_t len;
 };
 
 struct blockconsole {
@@ -122,7 +129,23 @@ struct blockconsole {
 	struct work_struct release_work;
 	struct task_struct *writeback_thread;
 	struct notifier_block panic_block;
+	int no_extents;
+	struct bcon_extent extent_map[MAX_EXTENTS];
 };
+
+/* Do the extent-based remapping in case of logging to files */
+static sector_t get_sector(struct blockconsole *bc, u64 fpos)
+{
+	sector_t logical = fpos >> SECTOR_SHIFT;
+	int i;
+
+	for (i = 0; i < bc->no_extents; i++) {
+		if (logical < bc->extent_map[i].len)
+			return logical + bc->extent_map[i].ofs;
+		logical -= bc->extent_map[i].len;
+	}
+	BUG();
+}
 
 static void bcon_get(struct blockconsole *bc)
 {
@@ -238,7 +261,7 @@ static int sync_read(struct blockconsole *bc, u64 ofs)
 	bio.bi_idx = 0;
 	bio.bi_size = SECTOR_SIZE;
 	bio.bi_bdev = bc->bdev;
-	bio.bi_sector = ofs >> SECTOR_SHIFT;
+	bio.bi_sector = get_sector(bc, ofs);
 	init_completion(&complete);
 	bio.bi_private = &complete;
 	bio.bi_end_io = request_complete;
@@ -270,7 +293,7 @@ static void bcon_erase_segment(struct blockconsole *bc)
 		bio->bi_bdev = bc->bdev;
 		bio->bi_private = bc;
 		bio->bi_idx = 0;
-		bio->bi_sector = (bc->write_bytes + i * PAGE_SIZE) >> 9;
+		bio->bi_sector = get_sector(bc, bc->write_bytes + i * PAGE_SIZE);
 		bcon_bio->in_flight = 1;
 		wmb();
 		/* We want the erase to go to the device first somehow */
@@ -432,7 +455,7 @@ static void bcon_writesector(struct blockconsole *bc, int index)
 	bio->bi_end_io = bcon_end_io;
 
 	bio->bi_idx = 0;
-	bio->bi_sector = bc->write_bytes >> 9;
+	bio->bi_sector = get_sector(bc, bc->write_bytes);
 	bcon_bio->in_flight = 1;
 	wmb();
 	submit_bio(WRITE, bio);
@@ -571,6 +594,171 @@ static int blockconsole_panic(struct notifier_block *this, unsigned long event,
 	return NOTIFY_DONE;
 }
 
+static int create_extent_map(struct blockconsole *bc, struct inode *inode)
+{
+	u64 max_size = i_size_read(inode) & ~CACHE_MASK;
+	sector_t last_block = max_size >> inode->i_blkbits;
+	sector_t probe_block = 0;
+	sector_t ofs;
+	sector_t no_secs = 0;
+	struct bcon_extent *extent = bc->extent_map;
+	unsigned long sec_per_block = 1 << (inode->i_blkbits - SECTOR_SHIFT);
+
+	bc->no_extents = 1;
+	for (; probe_block < last_block;
+			probe_block++, no_secs += sec_per_block) {
+		ofs = bmap(inode, probe_block);
+		if (!ofs)
+			return -EINVAL;
+		if (!extent->ofs) {
+			/* First iteration */
+			goto new_extent;
+		}
+		if (ofs * sec_per_block == extent->ofs + extent->len) {
+			/* Part of current extent */
+			extent->len += sec_per_block;
+			continue;
+		}
+		/* Extents currently have to be page-aligned for erase */
+		if (extent->len & (~PAGE_MASK >> SECTOR_SHIFT))
+			return -EINVAL;
+		/* New extent */
+		extent++;
+		bc->no_extents++;
+		if (extent == bc->extent_map + MAX_EXTENTS)
+			break;
+new_extent:
+		extent->ofs = ofs * sec_per_block;
+		extent->len = sec_per_block;
+	}
+	if (bc->extent_map[bc->no_extents - 1].len & (~PAGE_MASK >> SECTOR_SHIFT))
+		return -EINVAL;
+	bc->max_bytes = (no_secs << SECTOR_SHIFT) & ~CACHE_MASK;
+	/* If the file is too small or too fragmented, just give up */
+	if (bc->max_bytes < 4 << 20)
+		return -EINVAL;
+	return 0;
+}
+
+static int claim_logfile(struct blockconsole *bc, struct inode *inode)
+{
+	int err;
+
+	if (S_ISBLK(inode->i_mode)) {
+		bc->bdev = bdgrab(I_BDEV(inode));
+		/* FIXME: blkdev_put */
+		err = blkdev_get(bc->bdev, FMODE_READ | FMODE_WRITE, bcon_add);
+		if (err)
+			return -EINVAL;
+		bc->extent_map[0].ofs = 0;
+		bc->extent_map[0].len = bc->bdev->bd_inode->i_size & ~CACHE_MASK;
+		bc->max_bytes = i_size_read(inode) & ~CACHE_MASK;
+	} else if (S_ISREG(inode->i_mode)) {
+		bc->bdev = inode->i_sb->s_bdev;
+		mutex_lock(&inode->i_mutex);
+		return create_extent_map(bc, inode);
+	} else
+		return -EINVAL;
+	return 0;
+}
+
+static void unclaim_logfile(struct blockconsole *bc, struct inode *inode)
+{
+	if (S_ISBLK(inode->i_mode))
+		blkdev_put(bc->bdev, FMODE_READ | FMODE_WRITE);
+	else {
+		inode->i_flags &= ~S_SWAPFILE;
+		mutex_unlock(&inode->i_mutex);
+	}
+}
+
+static int __bcon_create(struct blockconsole *bc)
+{
+	int err = -ENOMEM;
+
+	bc->pages = alloc_pages(GFP_KERNEL, 8);
+	if (!bc->pages)
+		goto out;
+	bc->zero_page = alloc_pages(GFP_KERNEL, 0);
+	if (!bc->zero_page)
+		goto out1;
+
+	bcon_init_bios(bc);
+	bcon_init_zero_bio(bc);
+	setup_timer(&bc->pad_timer, bcon_pad, (unsigned long)bc);
+	err = bcon_find_end_of_log(bc);
+	if (err)
+		goto out2;
+	kref_init(&bc->kref); /* This reference gets freed on errors */
+	bc->writeback_thread = kthread_run(bcon_writeback, bc, "bcon_%s",
+			bc->devname);
+	if (IS_ERR(bc->writeback_thread)) {
+		err = PTR_ERR(bc->writeback_thread);
+		goto out2;
+	}
+
+	INIT_WORK(&bc->unregister_work, bcon_unregister);
+	INIT_WORK(&bc->release_work, __bcon_release);
+	register_console(&bc->console);
+	bc->panic_block.notifier_call = blockconsole_panic;
+	bc->panic_block.priority = INT_MAX;
+	atomic_notifier_chain_register(&panic_notifier_list, &bc->panic_block);
+	pr_info("now logging to %s at %llx\n", bc->devname,
+			atomic64_read(&bc->console_bytes) >> 20);
+	return 0;
+out2:
+	__free_pages(bc->zero_page, 0);
+out1:
+	__free_pages(bc->pages, 8);
+out:
+	return err;
+}
+
+static int bcon_add_file(const char *name, struct kernel_param *kp)
+{
+	struct blockconsole *bc;
+	struct file *file = NULL;
+	struct address_space *mapping;
+	struct inode *inode;
+	int err;
+
+	bc = kzalloc(sizeof(*bc), GFP_KERNEL);
+	if (!bc)
+		return -ENOMEM;
+	spin_lock_init(&bc->end_io_lock);
+	strcpy(bc->console.name, "bcon");
+	bc->console.flags = CON_PRINTBUFFER | CON_ENABLED | CON_ALLDATA;
+	bc->console.write = bcon_write;
+
+	memset(bc->devname, ' ', sizeof(bc->devname));
+	strlcpy(bc->devname, name, sizeof(bc->devname));
+
+	file = filp_open(name, O_RDWR|O_LARGEFILE, 0);
+	if (IS_ERR(file)) {
+		err = PTR_ERR(file);
+		goto out;
+	}
+	mapping = file->f_mapping;
+	inode = mapping->host;
+
+	err = claim_logfile(bc, inode);
+	if (err)
+		goto out1;
+
+	err = __bcon_create(bc);
+	if (err)
+		goto out2;
+	return err;
+
+out2:
+	unclaim_logfile(bc, inode);
+out1:
+	filp_close(file, NULL);
+out:
+	kfree(bc);
+	return err;
+}
+
 static int bcon_create(dev_t devt)
 {
 	const fmode_t mode = FMODE_READ | FMODE_WRITE;
@@ -592,38 +780,16 @@ static int bcon_create(dev_t devt)
 	memset(bc->devname, ' ', sizeof(bc->devname));
 	strlcpy(bc->devname, dev_name(part_to_dev(bc->bdev->bd_part)),
 			sizeof(bc->devname));
-	bc->pages = alloc_pages(GFP_KERNEL, 8);
-	if (!bc->pages)
-		goto out;
-	bc->zero_page = alloc_pages(GFP_KERNEL, 0);
-	if (!bc->zero_page)
-		goto out1;
-	bcon_init_bios(bc);
-	bcon_init_zero_bio(bc);
-	setup_timer(&bc->pad_timer, bcon_pad, (unsigned long)bc);
-	bc->max_bytes = bc->bdev->bd_inode->i_size & ~CACHE_MASK;
-	err = bcon_find_end_of_log(bc);
-	if (err)
-		goto out2;
-	kref_init(&bc->kref); /* This reference gets freed on errors */
-	bc->writeback_thread = kthread_run(bcon_writeback, bc, "bcon_%s",
-			bc->devname);
-	if (IS_ERR(bc->writeback_thread))
-		goto out2;
-	INIT_WORK(&bc->unregister_work, bcon_unregister);
-	INIT_WORK(&bc->release_work, __bcon_release);
-	register_console(&bc->console);
-	bc->panic_block.notifier_call = blockconsole_panic;
-	bc->panic_block.priority = INT_MAX;
-	atomic_notifier_chain_register(&panic_notifier_list, &bc->panic_block);
-	pr_info("now logging to %s at %llx\n", bc->devname,
-			atomic64_read(&bc->console_bytes) >> 20);
-	return 0;
 
-out2:
-	__free_pages(bc->zero_page, 0);
-out1:
-	__free_pages(bc->pages, 8);
+	bc->max_bytes = bc->bdev->bd_inode->i_size & ~CACHE_MASK;
+	bc->no_extents = 1;
+	bc->extent_map[0].ofs = 0;
+	bc->extent_map[0].len = bc->max_bytes >> SECTOR_SHIFT;
+	err = __bcon_create(bc);
+	if (err)
+		goto out;
+	return err;
+
 out:
 	kfree(bc);
 	/* Not strictly correct, be the caller doesn't care */
@@ -660,3 +826,5 @@ void bcon_add(dev_t devt)
 	INIT_WORK(&cand->work, bcon_do_add);
 	schedule_work(&cand->work);
 }
+
+module_param_call(device, bcon_add_file, NULL, NULL, 0200);
