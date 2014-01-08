@@ -656,6 +656,10 @@ static int claim_logfile(struct blockconsole *bc, struct inode *inode)
 	} else if (S_ISREG(inode->i_mode)) {
 		bc->bdev = inode->i_sb->s_bdev;
 		mutex_lock(&inode->i_mutex);
+		if (IS_SWAPFILE(inode)) {
+			mutex_unlock(&inode->i_mutex);
+			return -EBUSY;
+		}
 		return create_extent_map(bc, inode);
 	} else
 		return -EINVAL;
@@ -667,7 +671,6 @@ static void unclaim_logfile(struct blockconsole *bc, struct inode *inode)
 	if (S_ISBLK(inode->i_mode))
 		blkdev_put(bc->bdev, FMODE_READ | FMODE_WRITE);
 	else {
-		inode->i_flags &= ~S_SWAPFILE;
 		mutex_unlock(&inode->i_mutex);
 	}
 }
@@ -748,6 +751,11 @@ static int bcon_add_file(const char *name, struct kernel_param *kp)
 	err = __bcon_create(bc);
 	if (err)
 		goto out2;
+
+	if (S_ISREG(inode->i_mode)) {
+		inode->i_flags |= S_SWAPFILE;
+		mutex_unlock(&inode->i_mutex);
+	}
 	return err;
 
 out2:
